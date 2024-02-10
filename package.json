@@ -9,5 +9,9 @@
   },
   "author": "",
   "license": "MIT",
-  "type": "module"
+  "type": "module",
+  "dependencies": {
+    "pac-resolver": "^7.0.0",
+    "quickjs-emscripten": "^0.27.0"
+  }
 }

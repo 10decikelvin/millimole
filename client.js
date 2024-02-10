@@ -2,109 +2,167 @@ import http from 'node:http';
 import net from 'node:net';
 import tls from 'node:tls';
 import { URL } from 'node:url';
+import { createPacResolver } from 'pac-resolver';
+import { readFile } from "node:fs/promises";
+import { setLogLevel, log } from './logging.js';
+import { getQuickJS } from 'quickjs-emscripten';
+
+setLogLevel(2);
+let PORT = parseInt(process.env.PORT) || 59400;
+
+//ohhhhhhhhhhhhhhh god the proxy file shenanigans
+
+const wpadFile = process.env.PAC_FILE_LOCATION ? await readFile(process.env.PAC_FILE_LOCATION, "utf8") : undefined;
+const FindProxyForURL = wpadFile ? createPacResolver(await getQuickJS(), wpadFile) : undefined;
+const moddedFile = wpadFile ? `
+function FindProxyForURL(url, host){
+  ${wpadFile.replace(/FindProxyForURL/g, "_FindProxyForURL")}
+  var result = _FindProxyForURL(url, host);
+  var catchAll = _FindProxyForURL("https://google.com:443", "google.com");
+  if(result === catchAll){
+    return "PROXY localhost:${port}"
+  }else{
+    return result; //NOTE: "evil" corporate proxies may exploit this to make blocked sites point to defunct proxies. In this case, just don't specify a PAC file.
+  }
+}` : undefined;
+
+
 
 let PRI_PROXY = null;
 if(process.env.PRI_PROXY){
-    let results = /^(http):\/\/(?:([^:]+):([^@]+)@)?([^:]+):(\d+)$/.exec(process.env.PRI_PROXY)
-    if(results){
-        PRI_PROXY = {
-            useTLS: false, // Only plain text CONNECT proxies are supported right now
-            username: results[2],
-            password: results[3],
-            hostname: results[4],
-            port: parseInt(results[5])
-        }
+    let results = /^(http):\/\/(?:([^:]+):([^@]+)@)?([^:]+):(\d+)$/.exec(process.env.PRI_PROXY);
+    if(results !== null){
+      PRI_PROXY = {
+        useTLS: false, // Only plain text CONNECT proxies are supported right now
+        username: results[2],
+        password: results[3],
+        hostname: results[4],
+        port: parseInt(results[5])
+      }
+    }else{
+      log(2, "PRI_PROXY: Invalid configuration for primary proxy.");
+      process.exit(0);
     }
+}else{
+  log(0, "PRI_PROXY: Skipping using primary proxy")
 }
-let SEC_PROXY = null;
+
+var SEC_PROXY = null;
 if(process.env.SEC_PROXY){
     let results = /^(posts?):\/\/([^@]+)@([^:]+):(\d+)$/.exec(process.env.SEC_PROXY);
-    if(results){
+    if(results !== null){
         SEC_PROXY = {
-            useTLS: results[1] === "post" ? false : results[1] === "posts" ? true : (() => {throw new Error("Bad primary proxy protocol")})(),
+            useTLS: results[1] === "post" ? false : results[1] === "posts" ? true : (() => {throw new Error("Bad SEC proxy protocol")})(),
             token: results[2],
             hostname: results[3],
             port: parseInt(results[4])
         }
+    }else{
+      log(2, "SEC_PROXY: Invalid configuration for secondary proxy.");
+      process.exit(0)
     }
+}else{
+  console.log("SEC_PROXY: No secondary proxy provided.")
+  process.exit(0)
 }
 
 let SMART_ROUTING = !!process.env.SMART_ROUTING;
 
-if(!PRI_PROXY || !SEC_PROXY){
-    throw new Error("Double check BOTH your primary and secondary proxy configurations")
-}
-
-function getConnectStream(dest){
-  return new Promise((res, rej) => {
-    let serverSocket = net.connect(PRI_PROXY.port, PRI_PROXY.hostname, async () => {
-        let head = `CONNECT ${dest.hostname}:${dest.port} HTTP/1.1\r\nHost: ${dest.hostname}\r\n`;
-        if(PRI_PROXY.username && PRI_PROXY.password){
-            head += `Proxy-Authorization: ${bota(PRI_PROXY.username + ":" + PRI_PROXY.password)}\r\n`
-        }
-        head += "\r\n";
-        serverSocket.write(head);
-        let data = await waitForData(serverSocket);
-        let statusCode = parseInt(splitFirstBuffer(data, newLine).toString("ascii").split(" ")[1]);
-        if(statusCode !== 200) return rej(statusCode)
+/**
+ * Gets a stream to some address
+ * @param {"DIRECT" | string} mode specify direct to use direct connection; other values result in PRI_PROXY being used
+ * @param {*} dest 
+ * @returns {Promise<import("net").Socket>}
+ */
+function getStream(mode, dest){
+  if(mode === "DIRECT"){
+    return new Promise(res => {
+      let serverSocket = net.connect(dest.port, dest.hostname, () => {
         if(!dest.useTLS) return res(serverSocket);
         res(new tls.TLSSocket(serverSocket));
+      })
     });
-  })
+  }else{
+    return new Promise((res, rej) => {
+      let serverSocket = net.connect(PRI_PROXY.port, PRI_PROXY.hostname, async () => {
+          let head = `CONNECT ${dest.hostname}:${dest.port} HTTP/1.1\r\nHost: ${dest.hostname}\r\n`;
+          if(PRI_PROXY.username && PRI_PROXY.password){
+              head += `Proxy-Authorization: Basic ${btoa(PRI_PROXY.username + ":" + PRI_PROXY.password)}\r\n`
+          }
+          head += "\r\n";
+          serverSocket.write(head);
+          let data = await waitForData(serverSocket);
+          let statusCode = parseInt(splitFirstBuffer(data, newLine).toString("ascii").split(" ")[1]);
+          if(statusCode === 407){
+            return rej(new Error(`Invalid PRI_PROXY auth credentials.`))
+          }
+          if(statusCode !== 200) return rej(statusCode)
+          if(!dest.useTLS) return res(serverSocket);
+          res(new tls.TLSSocket(serverSocket));
+      });
+    })
+  }
 }
 
 const proxy = http.createServer((req, res) => {
-  res.writeHead(500, { 'Content-Type': 'text/plain' });
-  res.end();
+  if(req.url === "/wpad"){
+    res.end(moddedFile);
+  }else{
+    res.writeHead(500, { 'Content-Type': 'text/plain' });
+    res.end();
+  }
 });
 
 let blocked = new Set();
 proxy.on('connect', async ({url}, clientSocket, _) => {
   const { port, hostname } = new URL(`http://${url}`);
-  if(!port){
-    console.log("skipping request since no port", hostname);
-    return;
-  }
+  if(!port) return console.log("skipping request since no port", hostname);
+  // if no pri proxy, direct
+  // if there is a pac, follow the pac
+  // if there is no pac, follow PRI_PROXT
+  let mode = PRI_PROXY === null ? "DIRECT" : (FindProxyForURL ? await FindProxyForURL(`http${port === 443 ? "s" : ""}://${hostname}:${port}`) : "PROXY");
+
   if(!SMART_ROUTING || blocked.has(hostname)){
     //bypass proxy if smart routing is disabled OR its blocked
-    await bypassProxy(clientSocket, {hostname, port: port });
+    await foreignBounce(mode, clientSocket, {hostname, port: port });
   }else{
     try{
-      await normalProxy(clientSocket, {hostname, port: port });
+      await noBounce(mode, clientSocket, {hostname, port: port });
     }catch(e){
       console.log(`!!! ${hostname}:${port} added to bypass list (errcode ${e})`);
       await blocked.add(hostname);
-      await bypassProxy(clientSocket, {hostname, port: port });
+      await foreignBounce(mode, clientSocket, {hostname, port: port });
     }
   }
 });
-proxy.listen(59400)
-console.log("HTTP CONNECT Proxy listening on port 59400")
+proxy.listen(PORT)
+console.log(`HTTP CONNECT Proxy listening on port ${PORT}`)
 /**
  * 
- * Strategy 1: USe the school proxy like a normal child. Throws errors if blocked by school
+ * NoBounce: take the shortest path possible to the destination
  * 
  */
-async function normalProxy(clientSocket, {hostname, port}){
-  let serverSocket = await getConnectStream({hostname, port, useTLS: false});
-  clientSocket.write('HTTP/1.1 200 Connection Established\r\nProxy-agent: Node.js-Proxy\r\n\r\n');
+async function noBounce(mode, clientSocket, {hostname, port}){
+  let serverSocket = await getStream(mode, {hostname, port, useTLS: false}); //don't use TLS as the client itself should negotiate it
   serverSocket.pipe(clientSocket);
   clientSocket.pipe(serverSocket);
   serverSocket.on("error", console.error);
   clientSocket.on("error", console.error);
   serverSocket.on("close", () => clientSocket.closed || clientSocket.end())
   clientSocket.on("close", () => serverSocket.closed || serverSocket.end())
+  //ready
+  clientSocket.write('HTTP/1.1 200 Connection Established\r\nProxy-agent: Node.js-Proxy\r\n\r\n');
 }
 /**
  * 
- * Strategy 2: Bypass the school proxy like the pros
+ * Bounce: bounce through the post(s) server 
  * 
  */
-async function bypassProxy(clientSocket, {hostname, port}){
+async function foreignBounce(mode, clientSocket, {hostname, port}){
   const sessionNumber = Math.round((Date.now() * 36 * 36 + Math.random() * 36 * 36) % 36 ** 4).toString(36);
   console.log(`[${sessionNumber}] ${hostname}:${port} Bypassing proxy...`)
   let zeroLengthChunkReceived = false;
-  let serverSocket = await getConnectStream(SEC_PROXY);
+  let serverSocket = await getStream(mode, SEC_PROXY);
   console.log("connected")
   serverSocket.write(`POST / HTTP/1.1\r\nHost: ${SEC_PROXY.hostname}:${SEC_PROXY.port}\r\nauthorization: Bearer ${SEC_PROXY.token}\r\nx-dest-hostname: ${hostname}\r\nx-dest-port: ${port}\r\nx-sessionid: ${sessionNumber}\r\nTransfer-Encoding: chunked\r\n\r\n`)
   await waitForData(serverSocket);
