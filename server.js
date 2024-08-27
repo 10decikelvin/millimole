@@ -1,13 +1,14 @@
+import { readFile } from 'node:fs/promises';
 import http from 'node:http';
 import net from 'node:net';
 
+const decoyFile = await readFile("decoy.html");
 const TOKEN = process.env.TOKEN;
 const proxy = http.createServer(function (req, res) {
   if(req.headers["authorization"] !== "Bearer " + TOKEN) {
     //don't let people know ur hosting sneaky stuff
-    res.statusCode = 301;
-    res.setHeader("location", "https://10decikelvin.github.io");
-    res.end();
+    res.statusCode = 200;
+    res.end(decoyFile);
     return;
   };
   let sessionid = req.headers["x-sessionid"];
@@ -23,9 +24,8 @@ const proxy = http.createServer(function (req, res) {
   console.log(`[${sessionid}] ${hostname} ${port}`);
   let serverSocket = net.connect(port, hostname, function() {
     console.log(`[${sessionid}] Connected`);
-    res.statusCode = 200;
+    res.statusCode = 202;
     res.flushHeaders();
-    //do not use .write as it can cause severe buffering headaches
     serverSocket.pipe(res);
     req.pipe(serverSocket);
   });
@@ -42,5 +42,5 @@ const proxy = http.createServer(function (req, res) {
     serverSocket.destroy();
   }
 });
-proxy.listen(process.env.PORT || 7002)
+proxy.listen(process.env.PORT || 7002);
 console.log(`Listening on port ${process.env.PORT || 7002}`)

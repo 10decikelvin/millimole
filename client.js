@@ -8,27 +8,27 @@ import { setLogLevel, log } from './logging.js';
 import { getQuickJS } from 'quickjs-emscripten';
 
 setLogLevel(2);
+
 let PORT = parseInt(process.env.PORT) || 59400;
-
-//ohhhhhhhhhhhhhhh god the proxy file shenanigans
-
 const wpadFile = process.env.PAC_FILE_LOCATION ? await readFile(process.env.PAC_FILE_LOCATION, "utf8") : undefined;
+const SMART_ROUTING = !!process.env.SMART_ROUTING;
+let PRI_PROXY = null;
+var SEC_PROXY = null;
+
 const FindProxyForURL = wpadFile ? createPacResolver(await getQuickJS(), wpadFile) : undefined;
+const defaultConfig = FindProxyForURL ? await FindProxyForURL("https://google.com:443") : undefined;
 const moddedFile = wpadFile ? `
 function FindProxyForURL(url, host){
   ${wpadFile.replace(/FindProxyForURL/g, "_FindProxyForURL")}
   var result = _FindProxyForURL(url, host);
-  var catchAll = _FindProxyForURL("https://google.com:443", "google.com");
+  var catchAll = ${defaultConfig || `_FindProxyForURL("https://google.com:443", "google.com")`};
   if(result === catchAll){
-    return "PROXY localhost:${port}"
+    return "PROXY localhost:${PORT}"
   }else{
     return result; //NOTE: "evil" corporate proxies may exploit this to make blocked sites point to defunct proxies. In this case, just don't specify a PAC file.
   }
 }` : undefined;
 
-
-
-let PRI_PROXY = null;
 if(process.env.PRI_PROXY){
     let results = /^(http):\/\/(?:([^:]+):([^@]+)@)?([^:]+):(\d+)$/.exec(process.env.PRI_PROXY);
     if(results !== null){
@@ -47,7 +47,6 @@ if(process.env.PRI_PROXY){
   log(0, "PRI_PROXY: Skipping using primary proxy")
 }
 
-var SEC_PROXY = null;
 if(process.env.SEC_PROXY){
     let results = /^(posts?):\/\/([^@]+)@([^:]+):(\d+)$/.exec(process.env.SEC_PROXY);
     if(results !== null){
@@ -66,21 +65,21 @@ if(process.env.SEC_PROXY){
   process.exit(0)
 }
 
-let SMART_ROUTING = !!process.env.SMART_ROUTING;
 
 /**
  * Gets a stream to some address
  * @param {"DIRECT" | string} mode specify direct to use direct connection; other values result in PRI_PROXY being used
- * @param {*} dest 
- * @returns {Promise<import("net").Socket>}
+ * @param {{port: number, hostname: "string"}} dest 
+ * @returns {Promise<import("net").Socket | import("tls").TLSSocket>}
  */
 function getStream(mode, dest){
   if(mode === "DIRECT"){
     return new Promise(res => {
-      let serverSocket = net.connect(dest.port, dest.hostname, () => {
-        if(!dest.useTLS) return res(serverSocket);
-        res(new tls.TLSSocket(serverSocket));
-      })
+      if(dest.useTLS){
+        let serverSocket = tls.connect(dest.port, dest.hostname, () => res(serverSocket));
+      }else{
+        let serverSocket = net.connect(dest.port, dest.hostname, () => res(serverSocket));
+      }
     });
   }else{
     return new Promise((res, rej) => {
@@ -98,7 +97,7 @@ function getStream(mode, dest){
           }
           if(statusCode !== 200) return rej(statusCode)
           if(!dest.useTLS) return res(serverSocket);
-          res(new tls.TLSSocket(serverSocket));
+          let secureSocket = tls.connect({socket: serverSocket}, () => res(secureSocket))
       });
     })
   }
@@ -109,7 +108,7 @@ const proxy = http.createServer((req, res) => {
     res.end(moddedFile);
   }else{
     res.writeHead(500, { 'Content-Type': 'text/plain' });
-    res.end();
+    res.end("Incorrect request.");
   }
 });
 
@@ -135,7 +134,7 @@ proxy.on('connect', async ({url}, clientSocket, _) => {
     }
   }
 });
-proxy.listen(PORT)
+proxy.listen(PORT);
 console.log(`HTTP CONNECT Proxy listening on port ${PORT}`)
 /**
  * 
@@ -163,7 +162,6 @@ async function foreignBounce(mode, clientSocket, {hostname, port}){
   console.log(`[${sessionNumber}] ${hostname}:${port} Bypassing proxy...`)
   let zeroLengthChunkReceived = false;
   let serverSocket = await getStream(mode, SEC_PROXY);
-  console.log("connected")
   serverSocket.write(`POST / HTTP/1.1\r\nHost: ${SEC_PROXY.hostname}:${SEC_PROXY.port}\r\nauthorization: Bearer ${SEC_PROXY.token}\r\nx-dest-hostname: ${hostname}\r\nx-dest-port: ${port}\r\nx-sessionid: ${sessionNumber}\r\nTransfer-Encoding: chunked\r\n\r\n`)
   await waitForData(serverSocket);
   console.log(`[${sessionNumber}] ${hostname}:${port} Connection established.`)
@@ -204,7 +202,7 @@ async function foreignBounce(mode, clientSocket, {hostname, port}){
  * Utility functions for buffer parsing
  * /
 /**
- * Hehehehhe TODO THIS ISNT VERY RELIABLE AS ONE MSG MAY TRIGGER TWO ON DATA CALLBACKS
+ * TODO THIS ISNT VERY RELIABLE AS ONE MSG MAY TRIGGER TWO ON DATA CALLBACKS
  * @param {ReadableStream} stream 
  */
 function waitForData(stream){
